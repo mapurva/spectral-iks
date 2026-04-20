@@ -1,0 +1,14 @@
+Metric,Value
+Nodes (N),25
+Edges,63
+Network Density,0.21
+Avg Clustering Coefficient,0.2226
+Algebraic Connectivity (λ₂),0.2095
+Avg Shortest Path Length,2.1533
+Diameter,4
+Avg Degree,5.04
+Avg Intra-group Weight,0.737
+Avg Inter-group Weight,0.286
+Seed Node (Diffusion),El-3
+Final Reach (8 steps),18
+Seed (reproducibility),42
