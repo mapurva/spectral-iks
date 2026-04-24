@@ -1,0 +1,468 @@
+# -*- coding: utf-8 -*-
+"""
+Validation and Sensitivity Analysis
+=====================================
+Spectral Analysis of Indigenous Social Networks
+Authors : Apurva Mehta, Chintan Chatterjee, Malay Bhatt
+Version : 1.0
+
+This module runs two validation experiments:
+
+  STEP 1 — Multiple Runs (Seed Stability)
+    Runs the full spectral analysis across 10 different random seeds.
+    Reports mean and standard deviation of λ₂, diffusion reach,
+    and top betweenness node role. Shows findings are not an
+    artefact of SEED=42.
+
+  STEP 2 — Sensitivity Analysis (Parameter Robustness)
+    Varies p_in and p_out systematically across plausible ranges.
+    Measures how λ₂, average clustering, and diffusion reach respond.
+    Shows findings hold across the parameter space grounded in
+    ethnographic literature (Table 3 of manuscript).
+
+Outputs
+-------
+  fig10a_seed_stability.png     — Figure 10A: λ₂ across 10 seeds
+  fig10b_sensitivity_lambda2.png — Figure 10B: λ₂ heatmap over p_in / p_out
+  fig10c_sensitivity_diffusion.png — Figure 10C: diffusion reach heatmap
+  validation_summary.csv        — Full numerical results for both experiments
+"""
+
+# =============================================================================
+# 0. Imports
+# =============================================================================
+import random
+from copy import deepcopy
+
+import matplotlib
+import matplotlib.pyplot as plt
+import matplotlib.patches as mpatches
+import numpy as np
+import pandas as pd
+import networkx as nx
+from scipy.sparse.linalg import eigsh
+from sklearn.cluster import KMeans
+
+import os
+OUTPUT_DIR = "outputs/"
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+# Publication plot style
+matplotlib.rcParams.update({
+    "figure.dpi":       150,
+    "savefig.dpi":      300,
+    "font.family":      "serif",
+    "font.size":        11,
+    "axes.labelsize":   11,
+    "axes.titlesize":   11,
+    "axes.titleweight": "normal",
+    "legend.fontsize":  9,
+    "xtick.labelsize":  9,
+    "ytick.labelsize":  9,
+    "figure.facecolor": "white",
+    "axes.spines.top":  False,
+    "axes.spines.right":False,
+})
+
+# =============================================================================
+# 1. Core network builder — seed as parameter
+# =============================================================================
+ROLES      = ["Elder", "Healer", "Youth", "Council", "Mediator"]
+ROLE_SIZES = [7, 5, 6, 4, 3]
+N          = sum(ROLE_SIZES)
+
+# Base P_MATRIX from manuscript Table 3
+P_MATRIX_BASE = np.array([
+    [0.70, 0.10, 0.08, 0.10, 0.08],
+    [0.10, 0.65, 0.15, 0.08, 0.10],
+    [0.08, 0.15, 0.55, 0.08, 0.12],
+    [0.10, 0.08, 0.08, 0.60, 0.15],
+    [0.08, 0.10, 0.12, 0.15, 0.50],
+])
+
+ROLE_COLORS = {
+    "Elder":    "#1b6ca8",
+    "Healer":   "#c0392b",
+    "Youth":    "#27ae60",
+    "Council":  "#8e44ad",
+    "Mediator": "#e67e22",
+}
+
+
+def build_network(seed: int = 42,
+                  p_matrix: np.ndarray = None) -> nx.Graph:
+    """
+    Build the indigenous knowledge-sharing network.
+
+    Parameters
+    ----------
+    seed     : int   — random seed for reproducibility
+    p_matrix : array — 5×5 connection probability matrix
+                       (defaults to manuscript Table 3 values)
+    """
+    if p_matrix is None:
+        p_matrix = P_MATRIX_BASE
+
+    rng        = np.random.default_rng(seed)
+    node_roles = []
+    for role, size in zip(ROLES, ROLE_SIZES):
+        node_roles.extend([role] * size)
+
+    G_raw   = nx.stochastic_block_model(
+                  ROLE_SIZES, p_matrix.tolist(), seed=seed)
+    mapping = {}
+    counters = {r: 1 for r in ROLES}
+    for i in range(N):
+        role        = node_roles[i]
+        mapping[i]  = f"{role[:2]}-{counters[role]}"
+        counters[role] += 1
+
+    G = nx.relabel_nodes(G_raw, mapping)
+    for i, (_, new) in enumerate(mapping.items()):
+        G.nodes[new]["role"] = node_roles[i]
+
+    for u, v in G.edges():
+        if G.nodes[u]["role"] == G.nodes[v]["role"]:
+            w = float(rng.beta(5, 2))
+            G[u][v]["type"] = "intra"
+        else:
+            w = float(rng.beta(2, 5))
+            G[u][v]["type"] = "inter"
+        G[u][v]["weight"] = round(w, 3)
+
+    return G
+
+
+def get_lambda2(G: nx.Graph) -> float:
+    """Return algebraic connectivity (Fiedler value) of weighted Laplacian."""
+    if not nx.is_connected(G):
+        return 0.0
+    return round(nx.algebraic_connectivity(G, weight="weight"), 6)
+
+
+def get_diffusion_reach(G: nx.Graph,
+                        base_prob: float = 0.35,
+                        steps: int = 8,
+                        seed: int = 42) -> int:
+    """
+    Run independent-cascade diffusion seeded from highest-betweenness
+    Elder node. Returns number of informed nodes after `steps` steps.
+    """
+    rng = np.random.default_rng(seed)
+
+    # Find highest-betweenness Elder
+    btwn  = nx.betweenness_centrality(G, weight="weight", normalized=True)
+    elder_nodes = [n for n in G.nodes() if G.nodes[n]["role"] == "Elder"]
+    if not elder_nodes:
+        seed_node = max(btwn, key=btwn.get)
+    else:
+        seed_node = max(elder_nodes, key=lambda n: btwn[n])
+
+    informed = {seed_node}
+    for _ in range(steps):
+        newly = set()
+        for u in informed:
+            for v in G.neighbors(u):
+                if v in informed:
+                    continue
+                if rng.random() < base_prob * G[u][v].get("weight", 1.0):
+                    newly.add(v)
+        informed |= newly
+    return len(informed)
+
+
+def get_top_betweenness_role(G: nx.Graph) -> str:
+    """Return the role of the node with highest betweenness centrality."""
+    btwn = nx.betweenness_centrality(G, weight="weight", normalized=True)
+    top  = max(btwn, key=btwn.get)
+    return G.nodes[top]["role"]
+
+
+# =============================================================================
+# STEP 1 — Multiple Runs: Seed Stability Analysis
+# =============================================================================
+print("=" * 60)
+print("STEP 1 — Seed Stability Analysis (10 random seeds)")
+print("=" * 60)
+
+SEEDS = [0, 7, 13, 21, 42, 55, 77, 99, 123, 256]
+seed_results = []
+
+for s in SEEDS:
+    G_s         = build_network(seed=s)
+    lam2        = get_lambda2(G_s)
+    reach       = get_diffusion_reach(G_s, seed=s)
+    top_role    = get_top_betweenness_role(G_s)
+    density     = round(nx.density(G_s), 4)
+    avg_clust   = round(nx.average_clustering(G_s, weight="weight"), 4)
+    n_edges     = G_s.number_of_edges()
+
+    seed_results.append({
+        "seed":           s,
+        "lambda2":        lam2,
+        "diffusion_reach":reach,
+        "reach_pct":      round(reach / N * 100, 1),
+        "top_btwn_role":  top_role,
+        "density":        density,
+        "avg_clustering": avg_clust,
+        "n_edges":        n_edges,
+    })
+    print(f"  Seed {s:>3}: λ₂={lam2:.4f}  reach={reach}/{N} "
+          f"({reach/N*100:.0f}%)  top_role={top_role}")
+
+seed_df = pd.DataFrame(seed_results)
+
+# Summary statistics
+print(f"\n  λ₂  — mean={seed_df['lambda2'].mean():.4f}  "
+      f"std={seed_df['lambda2'].std():.4f}  "
+      f"CV={seed_df['lambda2'].std()/seed_df['lambda2'].mean()*100:.1f}%")
+print(f"  Reach — mean={seed_df['diffusion_reach'].mean():.1f}  "
+      f"std={seed_df['diffusion_reach'].std():.2f}")
+print(f"  Top betweenness role = Healer in "
+      f"{(seed_df['top_btwn_role']=='Healer').sum()}/10 runs")
+
+# ── Figure 10A: Seed stability plot ─────────────────────────────────────────
+fig10a, axes = plt.subplots(1, 2, figsize=(11, 4))
+
+# Left: λ₂ across seeds
+ax = axes[0]
+colors_bar = ["#c0392b" if s == 42 else "#1b6ca8" for s in seed_df["seed"]]
+bars = ax.bar(range(len(SEEDS)), seed_df["lambda2"],
+              color=colors_bar, edgecolor="white", width=0.65)
+ax.axhline(y=seed_df["lambda2"].mean(), color="#27ae60",
+           linestyle="--", linewidth=1.5,
+           label=f"Mean λ₂ = {seed_df['lambda2'].mean():.4f}")
+ax.axhspan(seed_df["lambda2"].mean() - seed_df["lambda2"].std(),
+           seed_df["lambda2"].mean() + seed_df["lambda2"].std(),
+           alpha=0.12, color="#27ae60", label="±1 SD")
+ax.set_xticks(range(len(SEEDS)))
+ax.set_xticklabels([str(s) for s in SEEDS], fontsize=8)
+ax.set_xlabel("Random Seed")
+ax.set_ylabel("Algebraic Connectivity (λ₂)")
+ax.set_title("(A) λ₂ Stability Across 10 Seeds", loc="left", pad=8)
+ax.legend(fontsize=8)
+# Annotate SEED=42 (manuscript seed)
+idx42 = SEEDS.index(42)
+ax.annotate("Manuscript\nseed (42)",
+            xy=(idx42, seed_df["lambda2"].iloc[idx42]),
+            xytext=(idx42 + 0.8, seed_df["lambda2"].iloc[idx42] + 0.015),
+            fontsize=8, color="#c0392b",
+            arrowprops=dict(arrowstyle="->", color="#c0392b", lw=1.2))
+
+# Right: Diffusion reach across seeds
+ax = axes[1]
+reach_colors = ["#c0392b" if s == 42 else "#8e44ad" for s in seed_df["seed"]]
+ax.bar(range(len(SEEDS)), seed_df["reach_pct"],
+       color=reach_colors, edgecolor="white", width=0.65)
+ax.axhline(y=seed_df["reach_pct"].mean(), color="#27ae60",
+           linestyle="--", linewidth=1.5,
+           label=f"Mean reach = {seed_df['reach_pct'].mean():.1f}%")
+ax.axhspan(seed_df["reach_pct"].mean() - seed_df["reach_pct"].std(),
+           seed_df["reach_pct"].mean() + seed_df["reach_pct"].std(),
+           alpha=0.12, color="#27ae60", label="±1 SD")
+ax.set_xticks(range(len(SEEDS)))
+ax.set_xticklabels([str(s) for s in SEEDS], fontsize=8)
+ax.set_xlabel("Random Seed")
+ax.set_ylabel("Diffusion Reach (%)")
+ax.set_title("(B) Diffusion Reach Stability Across 10 Seeds", loc="left", pad=8)
+ax.legend(fontsize=8)
+ax.set_ylim(0, 105)
+
+plt.tight_layout()
+fig10a.savefig(OUTPUT_DIR + "fig10a_seed_stability.png", bbox_inches="tight")
+plt.close(fig10a)
+print("\nSaved: fig10a_seed_stability.png")
+
+
+# =============================================================================
+# STEP 2 — Sensitivity Analysis: p_in and p_out Variation
+# =============================================================================
+print("\n" + "=" * 60)
+print("STEP 2 — Sensitivity Analysis (p_in × p_out grid)")
+print("=" * 60)
+
+# Vary diagonal p_in (all roles shift equally) and off-diagonal p_out
+# These ranges span ±0.15 around the base values — a conservative range
+# consistent with uncertainty in ethnographic parameter estimation.
+
+P_IN_VALUES  = [0.45, 0.50, 0.55, 0.60, 0.65, 0.70, 0.75, 0.80]
+P_OUT_VALUES = [0.04, 0.06, 0.08, 0.10, 0.12, 0.14, 0.16, 0.18]
+
+# Base diagonal and off-diagonal values
+BASE_DIAG    = np.diag(P_MATRIX_BASE).copy()          # [0.70,0.65,0.55,0.60,0.50]
+BASE_OFFDIAG = P_MATRIX_BASE.copy()
+np.fill_diagonal(BASE_OFFDIAG, 0)
+BASE_OFFDIAG_MEAN = BASE_OFFDIAG[BASE_OFFDIAG > 0].mean()  # ≈ 0.104
+
+sensitivity_results = []
+
+for p_in_scale in P_IN_VALUES:
+    for p_out_scale in P_OUT_VALUES:
+
+        # Build scaled matrix
+        # Scale diagonals to p_in_scale (uniform shift across all roles)
+        # Scale off-diagonals proportionally to p_out_scale
+        scale_diag    = p_in_scale  / BASE_DIAG.mean()
+        scale_offdiag = p_out_scale / BASE_OFFDIAG_MEAN
+
+        new_matrix = P_MATRIX_BASE.copy()
+        # Scale diagonals
+        for i in range(5):
+            new_matrix[i, i] = min(0.95, BASE_DIAG[i] * scale_diag)
+        # Scale off-diagonals
+        for i in range(5):
+            for j in range(5):
+                if i != j:
+                    new_matrix[i, j] = min(
+                        new_matrix[i, i] - 0.05,
+                        BASE_OFFDIAG[i, j] * scale_offdiag
+                    )
+                    new_matrix[i, j] = max(0.01, new_matrix[i, j])
+
+        # Ensure p_in > p_out for all roles (SBM requirement)
+        valid = all(new_matrix[i, i] > new_matrix[i, j]
+                    for i in range(5) for j in range(5) if i != j)
+        if not valid:
+            continue
+
+        try:
+            G_s    = build_network(seed=42, p_matrix=new_matrix)
+            lam2   = get_lambda2(G_s)
+            reach  = get_diffusion_reach(G_s, seed=42)
+            clust  = round(nx.average_clustering(G_s, weight="weight"), 4)
+            dens   = round(nx.density(G_s), 4)
+
+            sensitivity_results.append({
+                "p_in":           round(p_in_scale, 3),
+                "p_out":          round(p_out_scale, 3),
+                "lambda2":        lam2,
+                "diffusion_reach":reach,
+                "reach_pct":      round(reach / N * 100, 1),
+                "avg_clustering": clust,
+                "density":        dens,
+            })
+        except Exception as e:
+            print(f"  Skipped p_in={p_in_scale:.2f} p_out={p_out_scale:.2f}: {e}")
+
+sens_df = pd.DataFrame(sensitivity_results)
+print(f"\n  Grid size: {len(sens_df)} valid parameter combinations")
+print(f"  λ₂ range:  {sens_df['lambda2'].min():.4f} – "
+      f"{sens_df['lambda2'].max():.4f}")
+print(f"  Reach range: {sens_df['reach_pct'].min():.1f}% – "
+      f"{sens_df['reach_pct'].max():.1f}%")
+print(f"  λ₂ at manuscript params (approx p_in=0.62, p_out=0.10): "
+      f"{sens_df.loc[(sens_df['p_out']==0.10),'lambda2'].mean():.4f}")
+
+# Pivot for heatmaps
+lambda2_pivot = sens_df.pivot(
+    index="p_out", columns="p_in", values="lambda2")
+reach_pivot   = sens_df.pivot(
+    index="p_out", columns="p_in", values="reach_pct")
+
+# ── Figure 10B: λ₂ sensitivity heatmap ──────────────────────────────────────
+fig10b, ax = plt.subplots(figsize=(7, 5))
+im = ax.imshow(lambda2_pivot.values, aspect="auto",
+               cmap="RdYlGn", origin="lower",
+               vmin=sens_df["lambda2"].min(),
+               vmax=sens_df["lambda2"].max())
+cbar = plt.colorbar(im, ax=ax)
+cbar.set_label("Algebraic Connectivity (λ₂)", fontsize=10)
+
+ax.set_xticks(range(len(lambda2_pivot.columns)))
+ax.set_xticklabels([f"{v:.2f}" for v in lambda2_pivot.columns],
+                   fontsize=8, rotation=45)
+ax.set_yticks(range(len(lambda2_pivot.index)))
+ax.set_yticklabels([f"{v:.2f}" for v in lambda2_pivot.index], fontsize=8)
+ax.set_xlabel("Intra-group Connection Probability (p_in)")
+ax.set_ylabel("Inter-group Connection Probability (p_out)")
+ax.set_title("(C) Sensitivity of λ₂ to p_in and p_out", loc="left", pad=8)
+
+# Mark manuscript base parameters
+base_col = list(lambda2_pivot.columns).index(
+    min(lambda2_pivot.columns, key=lambda x: abs(x - 0.62)))
+base_row = list(lambda2_pivot.index).index(
+    min(lambda2_pivot.index, key=lambda x: abs(x - 0.10)))
+ax.plot(base_col, base_row, marker="*", color="black",
+        markersize=14, label="Manuscript parameters")
+ax.legend(fontsize=8, loc="upper left")
+
+plt.tight_layout()
+fig10b.savefig(OUTPUT_DIR + "fig10b_sensitivity_lambda2.png",
+               bbox_inches="tight")
+plt.close(fig10b)
+print("Saved: fig10b_sensitivity_lambda2.png")
+
+# ── Figure 10C: Diffusion reach sensitivity heatmap ─────────────────────────
+fig10c, ax = plt.subplots(figsize=(7, 5))
+im2 = ax.imshow(reach_pivot.values, aspect="auto",
+                cmap="RdYlGn", origin="lower",
+                vmin=sens_df["reach_pct"].min(),
+                vmax=sens_df["reach_pct"].max())
+cbar2 = plt.colorbar(im2, ax=ax)
+cbar2.set_label("Diffusion Reach (%)", fontsize=10)
+
+ax.set_xticks(range(len(reach_pivot.columns)))
+ax.set_xticklabels([f"{v:.2f}" for v in reach_pivot.columns],
+                   fontsize=8, rotation=45)
+ax.set_yticks(range(len(reach_pivot.index)))
+ax.set_yticklabels([f"{v:.2f}" for v in reach_pivot.index], fontsize=8)
+ax.set_xlabel("Intra-group Connection Probability (p_in)")
+ax.set_ylabel("Inter-group Connection Probability (p_out)")
+ax.set_title("(D) Sensitivity of Diffusion Reach to p_in and p_out",
+             loc="left", pad=8)
+
+ax.plot(base_col, base_row, marker="*", color="black",
+        markersize=14, label="Manuscript parameters")
+ax.legend(fontsize=8, loc="upper left")
+
+plt.tight_layout()
+fig10c.savefig(OUTPUT_DIR + "fig10c_sensitivity_diffusion.png",
+               bbox_inches="tight")
+plt.close(fig10c)
+print("Saved: fig10c_sensitivity_diffusion.png")
+
+# =============================================================================
+# 3. Save combined validation summary CSV
+# =============================================================================
+seed_df["experiment"]       = "seed_stability"
+sens_df_out                  = sens_df.copy()
+sens_df_out["seed"]          = 42
+sens_df_out["experiment"]    = "sensitivity_analysis"
+sens_df_out["top_btwn_role"] = "N/A"
+
+combined = pd.concat(
+    [seed_df[["experiment","seed","lambda2","diffusion_reach",
+              "reach_pct","avg_clustering","density"]],
+     sens_df_out[["experiment","p_in","p_out","lambda2",
+                  "diffusion_reach","reach_pct",
+                  "avg_clustering","density"]]],
+    ignore_index=True
+)
+combined.to_csv(OUTPUT_DIR + "validation_summary.csv", index=False)
+
+# =============================================================================
+# 4. Print manuscript-ready summary statistics
+# =============================================================================
+print("\n" + "=" * 60)
+print("MANUSCRIPT-READY NUMBERS — copy into Section 5.5")
+print("=" * 60)
+print(f"\nSEED STABILITY (10 seeds):")
+print(f"  λ₂  mean ± SD : {seed_df['lambda2'].mean():.4f} ± "
+      f"{seed_df['lambda2'].std():.4f}")
+print(f"  λ₂  CV        : {seed_df['lambda2'].std()/seed_df['lambda2'].mean()*100:.2f}%")
+print(f"  Reach mean±SD : {seed_df['diffusion_reach'].mean():.1f} ± "
+      f"{seed_df['diffusion_reach'].std():.2f} nodes")
+print(f"  Healer as top : {(seed_df['top_btwn_role']=='Healer').sum()}/10 runs")
+print(f"  Elder as top  : {(seed_df['top_btwn_role']=='Elder').sum()}/10 runs")
+
+print(f"\nSENSITIVITY ANALYSIS ({len(sens_df)} parameter combinations):")
+print(f"  λ₂  range     : {sens_df['lambda2'].min():.4f} – "
+      f"{sens_df['lambda2'].max():.4f}")
+print(f"  λ₂  always >0 : {(sens_df['lambda2'] > 0).all()}")
+print(f"  Reach range   : {sens_df['reach_pct'].min():.1f}% – "
+      f"{sens_df['reach_pct'].max():.1f}%")
+print(f"  Reach > 50%%  : {(sens_df['reach_pct'] > 50).sum()}/{len(sens_df)} "
+      f"combinations ({(sens_df['reach_pct']>50).mean()*100:.0f}%)")
+print(f"\nAll outputs saved to: {OUTPUT_DIR}")
+print("Files: fig10a_seed_stability.png  fig10b_sensitivity_lambda2.png")
+print("       fig10c_sensitivity_diffusion.png  validation_summary.csv")
